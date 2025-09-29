@@ -1,113 +1,76 @@
-name: win64-pdf2htmlEX (in-repo)
+name: build-win64
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for release upload on tags
 
 jobs:
-  build:
+  win64:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 (MINGW64)
+      # If this repo is NOT the pdf2htmlEX source, clone it now.
+      - name: Fetch pdf2htmlEX source (if needed)
+        shell: bash
+        run: |
+          set -e
+          if [ ! -e CMakeLists.txt ] && [ ! -e pdf2htmlEX/CMakeLists.txt ]; then
+            git clone --depth 1 https://github.com/pdf2htmlEX/pdf2htmlEX.git source
+            echo "SRCDIR=$PWD/source/pdf2htmlEX" >> $GITHUB_ENV
+          else
+            # You are already in the source tree
+            SRCDIR="$PWD"
+            [ -e pdf2htmlEX/CMakeLists.txt ] && SRCDIR="$PWD/pdf2htmlEX"
+            echo "SRCDIR=$SRCDIR" >> $GITHUB_ENV
+          fi
+
+      - name: MSYS2 / MinGW setup
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: >-
-            base-devel git cmake ninja zip
-            mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-poppler mingw-w64-x86_64-poppler-data
-            mingw-w64-x86_64-cairo mingw-w64-x86_64-freetype
-            mingw-w64-x86_64-libpng mingw-w64-x86_64-libjpeg-turbo
-            mingw-w64-x86_64-libxml2 mingw-w64-x86_64-icu
-            mingw-w64-x86_64-glib2 mingw-w64-x86_64-openjpeg2
-            mingw-w64-x86_64-lcms2 mingw-w64-x86_64-harfbuzz
-            mingw-w64-x86_64-fribidi mingw-w64-x86_64-zlib
-            mingw-w64-x86_64-fontforge mingw-w64-x86_64-libspiro
-            mingw-w64-x86_64-ntldd-git
+          release: true
           path-type: minimal
           cache: true
-          release: true
-          location: RUNNER_TEMP
-          platform-check-severity: fatal
+          install: >
+            base-devel
+            git
+            cmake
+            ninja
+            zip
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-poppler
+            mingw-w64-x86_64-poppler-data
+            mingw-w64-x86_64-cairo
+            mingw-w64-x86_64-freetype
+            mingw-w64-x86_64-libpng
+            mingw-w64-x86_64-libjpeg-turbo
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-icu
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-openjpeg2
+            mingw-w64-x86_64-lcms2
+            mingw-w64-x86_64-harfbuzz
+            mingw-w64-x86_64-fribidi
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-fontforge
+            mingw-w64-x86_64-libspiro
+            mingw-w64-x86_64-ntldd-git
+            mingw-w64-x86_64-tools-git   # gendef & dlltool
 
-      - name: Init env vars
-        shell: msys2 {0}
-        run: |
-          echo "SRCDIR=$PWD"  >> $GITHUB_ENV
-          echo "ROOTDIR=$PWD" >> $GITHUB_ENV
-
-      - name: Prepare Poppler & FontForge shims
-        shell: msys2 {0}
-        run: |
-          set -e
-          echo "== Poppler shims =="
-          mkdir -p "$ROOTDIR/poppler/build/glib" "$ROOTDIR/poppler/build"
-          [ -f /mingw64/lib/libpoppler-glib.dll.a ] && \
-            cp -u /mingw64/lib/libpoppler-glib.dll.a "$ROOTDIR/poppler/build/glib/libpoppler-glib.a" || true
-          [ -f /mingw64/lib/libpoppler.dll.a ] && \
-            cp -u /mingw64/lib/libpoppler.dll.a "$ROOTDIR/poppler/build/libpoppler.a" || true
-
-          echo "== FontForge shims =="
-          mkdir -p "$ROOTDIR/fontforge/build/lib"
-
-          copy_one() {
-            dest="$1"; shift
-            for pat in "$@"; do
-              for f in $pat; do
-                [ -f "$f" ] && { echo "  -> $dest <= $f"; cp -u "$f" "$dest"; return 0; }
-              done
-            done
-            echo "  !! not found: $dest (patterns: $*)"
-            return 1
-          }
-
-          # try import libs first
-          copy_one "$ROOTDIR/fontforge/build/lib/libfontforge.a" /mingw64/lib/libfontforge*.dll.a /mingw64/lib/libfontforge.a || true
-          copy_one "$ROOTDIR/fontforge/build/lib/libgdraw.a"     /mingw64/lib/libgdraw*.dll.a     /mingw64/lib/libgdraw.a     || true
-          copy_one "$ROOTDIR/fontforge/build/lib/libuninameslist.a" /mingw64/lib/libuninameslist*.dll.a /mingw64/lib/libuninameslist.a || true
-          copy_one "$ROOTDIR/fontforge/build/lib/libspiro.a"     /mingw64/lib/libspiro*.dll.a     /mingw64/lib/libspiro.a     || true
-
-          echo "== Synthesize missing import libs (gendef + dlltool) =="
-          mk_implib() {
-            base="$1"; shift
-            dest="$ROOTDIR/fontforge/build/lib/lib${base}.a"
-            [ -f "$dest" ] && { echo "  -> already present: $dest"; return 0; }
-            for pat in "$@"; do
-              for dll in $pat; do
-                if [ -f "$dll" ]; then
-                  echo "  -> making $dest from $dll"
-                  tmp="$(mktemp -d)"; cp "$dll" "$tmp/"; cd "$tmp"
-                  gendef "$(basename "$dll")" >/dev/null 2>&1 || true
-                  def_file="$(ls *.def 2>/dev/null | head -n1)"
-                  [ -n "$def_file" ] && dlltool -d "$def_file" -l "$dest" || echo "     !! no .def from $dll"
-                  cd - >/dev/null
-                  rm -rf "$tmp"
-                  [ -f "$dest" ] && { echo "     OK: $dest"; return 0; }
-                fi
-              done
-            done
-            echo "  !! could not synthesize lib${base}.a"
-            return 0
-          }
-          mk_implib fontforge /mingw64/bin/libfontforge*.dll /mingw64/bin/fontforge*.dll
-          mk_implib gdraw     /mingw64/bin/libgdraw*.dll
-          mk_implib gutils    /mingw64/bin/libgutils*.dll
-          mk_implib gunicode  /mingw64/bin/libgunicode*.dll
-
-          echo "=== Vendored shim tree ==="
-          ls -R "$ROOTDIR"/fontforge "$ROOTDIR"/poppler 2>/dev/null || true
-
-      - name: Configure
+      - name: Configure (CMake + Ninja)
         shell: msys2 {0}
         env:
-          PKG_CONFIG_EXECUTABLE: /mingw64/bin/pkg-config
-          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig
+          SRCDIR: ${{ env.SRCDIR }}
         run: |
           set -e
           cmake -S "$SRCDIR" -B build -G Ninja \
@@ -115,35 +78,91 @@ jobs:
             -DCMAKE_PREFIX_PATH=/mingw64 \
             -DCMAKE_CXX_STANDARD=17
 
+      # Make import libs for FontForge if MSYS2 doesn't ship them
+      - name: Create FontForge import libs if missing
+        shell: msys2 {0}
+        run: |
+          set -e
+          mkdir -p fontforge_shims
+          found_ff_lib=
+          for cand in /mingw64/lib/libfontforge*.dll.a; do
+            [ -f "$cand" ] && found_ff_lib="$cand" && break
+          done
+          if [ -z "$found_ff_lib" ]; then
+            echo "Generating import libs from DLLs..."
+            ff_dll=$(ls /mingw64/bin/libfontforge-*.dll 2>/dev/null | head -n1 || true)
+            gd_dll=$(ls /mingw64/bin/libgdraw-*.dll 2>/dev/null | head -n1 || true)
+            if [ -n "$ff_dll" ]; then
+              gendef "$ff_dll" - > fontforge_shims/libfontforge.def
+              dlltool -d fontforge_shims/libfontforge.def -l fontforge_shims/libfontforge.a
+            fi
+            if [ -n "$gd_dll" ]; then
+              gendef "$gd_dll" - > fontforge_shims/libgdraw.def
+              dlltool -d fontforge_shims/libgdraw.def -l fontforge_shims/libgdraw.a
+            fi
+          else
+            cp -u /mingw64/lib/libfontforge*.dll.a fontforge_shims/libfontforge.a || true
+            cp -u /mingw64/lib/libgdraw*.dll.a     fontforge_shims/libgdraw.a     || true
+          fi
+          # Make CMake see our shims first
+          echo "CMAKE_LIBRARY_PATH=$PWD/fontforge_shims" >> $GITHUB_ENV
+
       - name: Build
         shell: msys2 {0}
+        env:
+          CMAKE_LIBRARY_PATH: ${{ env.CMAKE_LIBRARY_PATH }}
         run: |
           set -e
           cmake --build build --parallel
-          EXE=""
-          [ -f build/pdf2htmlEX.exe ] && EXE="build/pdf2htmlEX.exe"
-          [ -z "$EXE" ] && [ -f build/src/pdf2htmlEX.exe ] && EXE="build/src/pdf2htmlEX.exe"
-          [ -z "$EXE" ] && { echo "::error ::pdf2htmlEX.exe not found"; ls -R build; exit 1; }
-          strip "$EXE" || true
-          echo "EXE=$EXE" >> $GITHUB_ENV
+          test -f build/pdf2htmlEX.exe || test -f build/src/pdf2htmlEX.exe
 
-      - name: Bundle DLLs (portable)
+      - name: Package (portable zip)
         shell: msys2 {0}
         run: |
           set -e
-          mkdir -p dist
-          cp "$EXE" dist/
-          ntldd -R dist/pdf2htmlEX.exe | awk '/=>/ {print $3}' | tr -d '\r' | sort -u | while read f; do
-            [ -f "$f" ] && cp -u "$f" dist/ || true
-          done
+          EXE="build/pdf2htmlEX.exe"
+          [ -f "$EXE" ] || EXE="build/src/pdf2htmlEX.exe"
+
+          DIST="dist/pdf2htmlEX"
+          mkdir -p "$DIST"
+          cp -u "$EXE" "$DIST/"
+
+          # gather runtime DLLs
+          mkdir -p "$DIST"/bin
+          ntldd -R "$EXE" \
+            | awk '/mingw64\\/bin/ { for(i=1;i<=NF;i++) if ($i ~ /mingw64\\/bin\\//) print $i }' \
+            | sort -u \
+            | while read -r dll; do
+                [ -f "$dll" ] && cp -u "$dll" "$DIST/bin/"
+              done
+
+          # include poppler-data (CMaps etc.)
           if [ -d /mingw64/share/poppler ]; then
-            mkdir -p dist/share
-            cp -r /mingw64/share/poppler dist/share/
+            mkdir -p "$DIST/share"
+            cp -r /mingw64/share/poppler "$DIST/share/"
           fi
-          ls -l dist/
+
+          # minimal README
+          cat > "$DIST/README.txt" << 'EOF'
+          pdf2htmlEX (Windows portable)
+          --------------------------------
+          Run:
+            .\pdf2htmlEX.exe --version
+            .\pdf2htmlEX.exe input.pdf
+
+          This bundle includes dependent DLLs and poppler-data.
+          EOF
+
+          (cd dist && zip -r ../pdf2htmlEX-win64.zip pdf2htmlEX)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pdf2htmlEX-win64-portable
-          path: dist/**
+          name: pdf2htmlEX-win64
+          path: dist/../pdf2htmlEX-win64.zip
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/../pdf2htmlEX-win64.zip
